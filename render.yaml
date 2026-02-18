@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: edgartools-mcp
+    runtime: python
+    buildCommand: pip install -e ".[ai]" && pip install starlette uvicorn
+    startCommand: python render_mcp_server.py
+    envVars:
+      - key: EDGAR_IDENTITY
+        value: sari kassar@umich.edu
+      - key: PORT
+        fromService:
+          type: web
+          name: edgartools-mcp
+          property: port
