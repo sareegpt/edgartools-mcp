@@ -1,100 +1,69 @@
 """
 EdgarTools MCP Server - HTTP deployment for Render.com
 
-Run locally:
-    python render_mcp_server.py
-
 Deploy on Render:
-    Build command: pip install -e ".[ai]" && pip install starlette uvicorn
+    Build command: pip install -e ".[ai]" && pip install uvicorn
     Start command: python render_mcp_server.py
     Environment variable: EDGAR_IDENTITY=sari kassar@umich.edu
+
+Endpoints:
+    GET  /health  - health check
+    POST /mcp     - MCP protocol
 """
 
 import logging
 import os
-from contextlib import asynccontextmanager
-from typing import Any
 
 import uvicorn
-from mcp.server import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.applications import Starlette
+from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Route
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("edgartools-mcp-http")
 
+# Set up EDGAR identity
+identity = os.environ.get("EDGAR_IDENTITY")
+if identity:
+    from edgar import set_identity
+    set_identity(identity)
+    logger.info(f"EDGAR identity set: {identity}")
+else:
+    logger.warning("EDGAR_IDENTITY not set")
 
-def setup_identity():
-    identity = os.environ.get("EDGAR_IDENTITY")
-    if identity:
-        from edgar import set_identity
-        set_identity(identity)
-        logger.info(f"EDGAR identity set: {identity}")
-    else:
-        logger.warning("EDGAR_IDENTITY not set — SEC requests may be rejected")
+# Import edgar tool handlers
+from edgar.ai.mcp.tools import company, search, filing, compare, ownership  # noqa
+from edgar.ai.mcp.tools.base import TOOLS, call_tool_handler
 
+# Create FastMCP server (path = /mcp by default)
+mcp = FastMCP("edgartools", stateless_http=True)
 
-def create_mcp_server() -> Server:
-    from edgar.ai.mcp.tools import company, search, filing, compare, ownership  # noqa
-    from edgar.ai.mcp.tools.base import TOOLS, call_tool_handler
-    from mcp import Tool
-    from mcp.types import TextContent
+# Register all edgar tools
+for tool_name, info in TOOLS.items():
+    def make_handler(name):
+        async def handler(**kwargs) -> str:
+            result = await call_tool_handler(name, kwargs)
+            return result.to_json()
+        handler.__name__ = name
+        return handler
 
-    mcp = Server("edgartools")
-
-    @mcp.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name=info["name"],
-                description=info["description"],
-                inputSchema=info["schema"]
-            )
-            for info in TOOLS.values()
-        ]
-
-    @mcp.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
-        if arguments is None:
-            arguments = {}
-        result = await call_tool_handler(name, arguments)
-        return [TextContent(type="text", text=result.to_json())]
-
-    return mcp
-
-
-setup_identity()
-mcp_server = create_mcp_server()
-session_manager = StreamableHTTPSessionManager(
-    app=mcp_server,
-    event_store=None,
-    json_response=False,
-    stateless=True,
-)
+    mcp.add_tool(
+        make_handler(tool_name),
+        name=tool_name,
+        description=info["description"],
+    )
 
 
 async def health(request: Request):
-    from edgar.ai.mcp.tools.base import TOOLS
     return JSONResponse({"status": "ok", "tools": list(TOOLS.keys())})
 
 
-@asynccontextmanager
-async def lifespan(app):
-    async with session_manager.run():
-        logger.info("EdgarTools MCP HTTP server ready")
-        yield
+# Add health route to FastMCP's Starlette app
+mcp._custom_starlette_routes = [Route("/health", health)]
 
-
-app = Starlette(
-    lifespan=lifespan,
-    routes=[
-        Route("/health", health),
-        Mount("/mcp", app=session_manager.handle_request),
-    ],
-)
+# Get the complete app (serves /mcp and /health)
+app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
